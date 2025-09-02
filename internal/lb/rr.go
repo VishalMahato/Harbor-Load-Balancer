@@ -1,4 +1,4 @@
-// roundrobin
+// roundrobin algo for the
 package lb
 
 import "sync/atomic"
