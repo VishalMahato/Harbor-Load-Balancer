@@ -1,12 +1,13 @@
-// roundrobin algo for the
 package lb
 
 import "sync/atomic"
 
-var rr uint64
+type RoundRobin struct{ ctr atomic.Uint64 }
 
-// Next returns an index in [0..n-1]
-func Next(n int) int {
-	i := atomic.AddUint64(&rr, 1)
+func (r *RoundRobin) Pick(n int) int {
+	i := r.ctr.Add(1)
 	return int(i % uint64(n))
 }
+func (r *RoundRobin) Start(int)   {}
+func (r *RoundRobin) Done(int)    {}
+func (r *RoundRobin) Rebuild(int) {}
