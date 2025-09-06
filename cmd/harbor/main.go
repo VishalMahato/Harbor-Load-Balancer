@@ -75,10 +75,8 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 				return nil
 				// gracefully shuting it down
 			}
-			// if you ever set ln.(*net.TCPListener).SetDeadline(...),
-			// treat deadline expirations as retryable
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
+
+			if isTransientAcceptErr(err) {
 				log.Println("accept timeout:", err)
 				// backoff to avoid hot loop during bursts
 				if tempDelay == 0 {
@@ -89,6 +87,7 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 						tempDelay = time.Second
 					}
 				}
+				log.Printf("accept transient error: %v; retrying in %v", err, tempDelay)
 				time.Sleep(tempDelay)
 				continue
 			}
@@ -113,30 +112,30 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 			}
 			defer b.Close()
 
-			// v0: one deadline to prevent zombies (we'll upgrade to sliding later)
-			deadline := time.Now().Add(ioTO)
-			_ = c.SetDeadline(deadline)
-			_ = b.SetDeadline(deadline)
-
-			bridge(c, b)
+			bridge(c, b, ioTO)
 		}(c)
 	}
 }
 
-func bridge(a, b net.Conn) {
+func bridge(a, b net.Conn, idle time.Duration) {
+	sa := &slidingConn{Conn: a, idle: idle}
+	sb := &slidingConn{Conn: b, idle: idle}
+
 	done := make(chan struct{}, 2)
 
+	// a -> b
 	go func() {
-		_, _ = io.Copy(a, b)
-		if t, ok := a.(*net.TCPConn); ok {
+		_, _ = io.Copy(sb, sa)
+		if t, ok := b.(*net.TCPConn); ok {
 			_ = t.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
 
+	// b -> a
 	go func() {
-		_, _ = io.Copy(b, a)
-		if t, ok := b.(*net.TCPConn); ok {
+		_, _ = io.Copy(sa, sb)
+		if t, ok := a.(*net.TCPConn); ok {
 			_ = t.CloseWrite()
 		}
 		done <- struct{}{}
@@ -157,4 +156,41 @@ func envMs(name string, def int) time.Duration {
 		return time.Duration(def) * time.Millisecond
 	}
 	return time.Duration(n) * time.Millisecond
+}
+
+// slidingConn bumps deadlines on every Read/Write, implementing an idle timeout.
+// If idle <= 0, no deadlines are set (i.e., no idle timeout).
+type slidingConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (s *slidingConn) Read(p []byte) (int, error) {
+	if s.idle > 0 {
+		_ = s.Conn.SetReadDeadline(time.Now().Add(s.idle))
+	}
+	return s.Conn.Read(p)
+}
+
+func (s *slidingConn) Write(p []byte) (int, error) {
+	if s.idle > 0 {
+		_ = s.Conn.SetWriteDeadline(time.Now().Add(s.idle))
+	}
+	return s.Conn.Write(p)
+}
+
+// Broad-but-safe classification without OS-specific errno checks.
+func isTransientAcceptErr(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && (ne.Timeout() || ne.Temporary()) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "too many open files") || // EMFILE/ENFILE
+		strings.Contains(msg, "no buffer space") || // ENOBUFS
+		strings.Contains(msg, "not enough memory") || // ENOMEM
+		strings.Contains(msg, "resource temporarily") || // EAGAIN/EWOULDBLOCK
+		strings.Contains(msg, "try again") ||
+		strings.Contains(msg, "connection aborted") || // ECONNABORTED
+		strings.Contains(msg, "protocol error")
 }
