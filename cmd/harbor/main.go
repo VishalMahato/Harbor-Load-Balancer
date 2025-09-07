@@ -40,7 +40,7 @@ func main() {
 	if listenAddr == "" {
 		listenAddr = ":9090"
 	}
-	//start listenming
+	// start listening
 	if err := listenAndProxy(listenAddr, pool); err != nil {
 		fmt.Println("error:", err)
 		os.Exit(1)
@@ -63,7 +63,17 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 	log.Println("Started listening on", addr)
 
 	dialTO := envMs("LB_DIAL_TIMEOUT_MS", 1500) // default 1.5s
-	ioTO := envMs("LB_IO_TIMEOUT_MS", 10000)    // default 10s (v0 single deadline)
+	ioTO := envMs("LB_IO_TIMEOUT_MS", 10000)
+	noDelay := envBool("LB_TCP_NODELAY", false)
+	kaPeriod := envMs("LB_TCP_KEEPALIVE_MS", 30000) // TCP keepalive probe period -- complements sliding idle logic
+	// keep alive is a kernel feature which sends tiny probe packets on an idle tcp connection to check if the peer is still there
+	//  and to keep nat and firewal mapings from expiring, If servel probes get No ACK , the OS mark the sockets dead
+	// and next read or writ on that connection errors out
+	// very useful for websoket , sse , gRPC
+
+	// NEW: concurrency cap (semaphore)
+	maxInFlight := envInt("LB_MAX_INFLIGHT", 1024) // 1024 concurent connection
+	sem := make(chan struct{}, maxInFlight)
 
 	var tempDelay time.Duration // exponential backoff on temporary/timeout errors e.g., OS under pressure, backlog/buffer/fd limits
 
@@ -73,11 +83,11 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 			// listener closed (e.g., during shutdown)
 			if errors.Is(err, net.ErrClosed) {
 				return nil
-				// gracefully shuting it down
+				// gracefully shutting it down
 			}
 
 			if isTransientAcceptErr(err) {
-				log.Println("accept timeout:", err)
+
 				// backoff to avoid hot loop during bursts
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
@@ -95,8 +105,28 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 			return err
 		}
 		tempDelay = 0
+		select {
+		case sem <- struct{}{}:
+			// acquired capacity — proceed
+		default:
+			_ = c.Close()
+
+			log.Printf("capacity full (LB_MAX_INFLIGHT=%d); dropped connection", maxInFlight)
+			continue
+		}
+		// Enable TCP keepalive on the accepted client socket -- client to LB
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(kaPeriod)
+			if noDelay {
+				_ = tc.SetNoDelay(true) //  controlled by LB_TCP_NODELAY
+			}
+
+		}
 
 		go func(c net.Conn) {
+			// release capacity slot and close client when done
+			defer func() { <-sem }()
 			defer c.Close()
 			target, release, ok := pool.Acquire()
 			if !ok {
@@ -105,12 +135,18 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 			defer release()
 
 			// dial with timeout so dead/blackholed backends fail fast
-			b, err := net.DialTimeout("tcp", target, dialTO)
+			// b, err := net.DialTimeout("tcp", target, dialTO)
+
+			d := &net.Dialer{Timeout: dialTO, KeepAlive: kaPeriod}
+			b, err := d.Dial("tcp", target)
 			if err != nil {
 				log.Println("dial error:", err)
 				return
 			}
 			defer b.Close()
+			if tb, ok := b.(*net.TCPConn); ok && noDelay {
+				_ = tb.SetNoDelay(true)
+			}
 
 			bridge(c, b, ioTO)
 		}(c)
@@ -145,17 +181,44 @@ func bridge(a, b net.Conn, idle time.Duration) {
 	<-done
 }
 
-// read millisecond env var with a sane default
+// to read bool env vars
+func envBool(name string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "t", "true", "y", "yes", "on":
+		return true
+	case "0", "f", "false", "n", "no", "off":
+		return false
+	}
+	return def
+}
+
+// to read time env vars- read millisecond env var with a sane default
 func envMs(name string, def int) time.Duration {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
 		return time.Duration(def) * time.Millisecond
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
+	if err != nil || n < 0 { // allow 0 to mean "disable"
 		return time.Duration(def) * time.Millisecond
 	}
-	return time.Duration(n) * time.Millisecond
+	return time.Duration(n) * time.Millisecond // returns 0 if n==0 -> “no idle timeout”
+}
+
+func envInt(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 // slidingConn bumps deadlines on every Read/Write, implementing an idle timeout.
@@ -182,7 +245,7 @@ func (s *slidingConn) Write(p []byte) (int, error) {
 // Broad-but-safe classification without OS-specific errno checks.
 func isTransientAcceptErr(err error) bool {
 	var ne net.Error
-	if errors.As(err, &ne) && (ne.Timeout() || ne.Temporary()) {
+	if errors.As(err, &ne) && (ne.Timeout()) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
