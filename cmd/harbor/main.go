@@ -1,18 +1,19 @@
 package main
 
 import (
-	"context" // NEW: for signal-aware context
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"os/signal" // NEW: to catch SIGINT/SIGTERM
+	"os/signal"
 	"strconv"
 	"strings"
-	"sync"    // NEW: wait for in-flight connections to drain
-	"syscall" // NEW: signal constants
+	"sync"
+	"sync/atomic" // NEW: metrics atomics
+	"syscall"
 	"time"
 
 	"github.com/vishalmahato/harbor-load-balancer/internal/lb"
@@ -39,13 +40,20 @@ func main() {
 
 	pool := lb.NewPool(backends, strat)
 
-	// real proxy
+	//  metrics server
+	metricsAddr := os.Getenv("LB_METRICS_ADDR")
+	if metricsAddr == "" {
+		metricsAddr = ":9100"
+	}
+	m := newMetrics()
+	startMetricsServer(metricsAddr, m, pool)
+
 	listenAddr := os.Getenv("LB_ADDR")
 	if listenAddr == "" {
 		listenAddr = ":9090"
 	}
-	// start listening
-	if err := listenAndProxy(listenAddr, pool); err != nil {
+
+	if err := listenAndProxy(listenAddr, pool, m); err != nil {
 		fmt.Println("error:", err)
 		os.Exit(1)
 	}
@@ -59,8 +67,7 @@ func main() {
 // exponentially increase the time and stop at 1 second
 // on next successfull accept we will reset the delay to 0
 
-// listenAndProxy is now an orchestrator: build config, wire signals, run loop, drain.
-func listenAndProxy(addr string, pool *lb.Pool) error {
+func listenAndProxy(addr string, pool *lb.Pool, m *metrics) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -87,7 +94,7 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 	}()
 
 	// Run the accept loop
-	if err := serveLoop(ctx, ln, pool, cfg, sem, &wg); err != nil {
+	if err := serveLoop(ctx, ln, pool, cfg, sem, &wg, m); err != nil { // NEW: pass metrics
 		return err
 	}
 
@@ -96,7 +103,7 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 }
 
 // serveLoop owns Accept/backoff and spawns per-connection handlers.
-func serveLoop(ctx context.Context, ln net.Listener, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup) error {
+func serveLoop(ctx context.Context, ln net.Listener, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup, m *metrics) error { // NEW: metrics
 	var tempDelay time.Duration // exponential backoff on temporary/timeout errors e.g., OS under pressure, backlog/buffer/fd limits
 
 	for {
@@ -108,23 +115,19 @@ func serveLoop(ctx context.Context, ln net.Listener, pool *lb.Pool, cfg proxyCon
 				break
 			}
 
-			if isTransientAcceptErr(err) {
+			atomic.AddInt64(&m.acceptErrorsTotal, 1)
 
-				// backoff to avoid hot loop during bursts
-				if tempDelay == 0 {
-					tempDelay = 5 * time.Millisecond
-				} else {
-					tempDelay *= 2
-					if tempDelay > time.Second {
-						tempDelay = time.Second
-					}
+			if tempDelay == 0 {
+				tempDelay = 5 * time.Millisecond
+			} else {
+				tempDelay *= 2
+				if tempDelay > time.Second {
+					tempDelay = time.Second
 				}
-				log.Printf("accept transient error: %v; retrying in %v", err, tempDelay)
-				time.Sleep(tempDelay)
-				continue
 			}
-			// otherwise: log and bail (or `continue` if you prefer)
-			return err
+			log.Printf("accept error: %v; retrying in %v", err, tempDelay)
+			time.Sleep(tempDelay)
+			continue
 		}
 		tempDelay = 0
 
@@ -132,31 +135,39 @@ func serveLoop(ctx context.Context, ln net.Listener, pool *lb.Pool, cfg proxyCon
 		if !acquireSlot(sem) {
 			_ = c.Close()
 
+			// metrics — capacity drop
+			atomic.AddInt64(&m.capacityDroppedTotal, 1)
+
 			log.Printf("capacity full (LB_MAX_INFLIGHT=%d); dropped connection", cfg.maxInFlight)
 			continue
 		}
+
+		// metrics — successful accept
+		atomic.AddInt64(&m.acceptsTotal, 1)
 
 		// Enable TCP keepalive on the accepted client socket -- client to LB
 		setClientSocketOptions(c, cfg)
 
 		wg.Add(1)
-		go handleConn(c, pool, cfg, sem, wg)
+		atomic.AddInt64(&m.activeConns, 1)      // NEW: metrics — gauge inc
+		go handleConn(c, pool, cfg, sem, wg, m) // NEW: pass metrics
 	}
 	return nil
 }
 
 // handleConn does per-connection work: retry dial, bridge, cleanup.
-func handleConn(c net.Conn, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup) {
+func handleConn(c net.Conn, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup, m *metrics) { // NEW: metrics
 	// release capacity slot and close client when done
 	defer func() { <-sem }()
 	defer c.Close()
 	//  mark handler complete for shutdown drain
 	defer wg.Done()
+	defer atomic.AddInt64(&m.activeConns, -1) // metrics — gauge dec
 
 	// dialer with timeout and keepalive for the backend side
 	d := &net.Dialer{Timeout: cfg.dialTO, KeepAlive: cfg.kaPeriod}
 
-	backend, release, err := dialBackendWithRetry(pool, d, cfg.maxRetries, cfg.cooldown)
+	backend, release, err := dialBackendWithRetry(pool, d, cfg.maxRetries, cfg.cooldown, m) // NEW: pass metrics
 	if err != nil {
 		// exhausted retries or no healthy backends
 		return
@@ -174,7 +185,7 @@ func handleConn(c net.Conn, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, w
 
 // dialBackendWithRetry selects a backend and dials it, retrying on failures.
 // Uses pool.Acquire()/release() and MarkDown(cooldown) on failures.
-func dialBackendWithRetry(pool *lb.Pool, d *net.Dialer, maxRetries int, cooldown time.Duration) (net.Conn, func(), error) {
+func dialBackendWithRetry(pool *lb.Pool, d *net.Dialer, maxRetries int, cooldown time.Duration, m *metrics) (net.Conn, func(), error) { // NEW: metrics
 	var (
 		backend net.Conn
 		target  string
@@ -186,15 +197,23 @@ func dialBackendWithRetry(pool *lb.Pool, d *net.Dialer, maxRetries int, cooldown
 	//  bounded retry loop across backends
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 
+		if attempt > 0 {
+			atomic.AddInt64(&m.retriesTotal, 1) //metrics — retry count
+		}
+
 		target, release, ok = pool.Acquire()
 		if !ok {
 			// no healthy backends available -- note:  Acquire skips those in cooldown
 			return nil, func() {}, fmt.Errorf("no healthy backends available")
 		}
 
+		//  metrics — note pick & total dials
+		m.recordPick(target)
+		atomic.AddInt64(&m.dialsTotal, 1)
+
 		backend, err = d.Dial("tcp", target)
 		if err == nil {
-			// success: break out and proceed with bridge
+			//  break out and proceed with bridge
 			return backend, release, nil
 		}
 
@@ -202,8 +221,11 @@ func dialBackendWithRetry(pool *lb.Pool, d *net.Dialer, maxRetries int, cooldown
 		release()
 		// mark the backend down for a short cooldown so Acquire() skips it next time
 		pool.MarkDown(target, cooldown)
-		log.Printf("dial error: target=%s err=%v (attempt %d/%d)", target, err, attempt+1, maxRetries+1)
 
+		// NEW: metrics — per-backend failure & total failures
+		m.recordDialFailure(target)
+
+		log.Printf("dial error: target=%s err=%v (attempt %d/%d)", target, err, attempt+1, maxRetries+1)
 		continue
 	}
 	// if still error persists return otherwise we have to release
@@ -293,6 +315,8 @@ func bridge(a, b net.Conn, idle time.Duration) {
 	// a -> b
 	go func() {
 		_, _ = io.Copy(sb, sa)
+		//if type of b is not net.TCPconn we can't call CloseWrite(),
+		// can't half close , it will be closed fully once done
 		if t, ok := b.(*net.TCPConn); ok {
 			_ = t.CloseWrite()
 		}

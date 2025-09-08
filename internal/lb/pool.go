@@ -38,7 +38,6 @@ func (p *Pool) SetStrategy(s Strategy) {
 
 // Acquire returns (addr, release, ok). Call release() when done to
 // decrement strategy-specific in-flight counters (LeastConn).
-
 func (p *Pool) Acquire() (string, func(), bool) {
 	p.mu.RLock()
 	n := len(p.nodes)
@@ -52,7 +51,7 @@ func (p *Pool) Acquire() (string, func(), bool) {
 		idx := p.strat.Pick(n)
 		addr := p.nodes[idx]
 		// skip if still cooling down.
-		if until, cooling := p.downUntil[addr]; cooling && now.Before((until)) {
+		if until, cooling := p.downUntil[addr]; cooling && now.Before(until) {
 			continue
 		}
 		// for leastconn have to start it as its track in-flight
@@ -63,6 +62,7 @@ func (p *Pool) Acquire() (string, func(), bool) {
 
 		return addr, release, true
 	}
+	p.mu.RUnlock()
 	return "", func() {}, false
 }
 
@@ -89,6 +89,7 @@ func (p *Pool) MarkDown(addr string, cooldown time.Duration) {
 	}
 	p.mu.Lock()
 	p.downUntil[addr] = time.Now().Add(cooldown)
+	p.mu.Unlock()
 }
 
 // MarkSuccess clears any cooldown mark for a backend.
@@ -107,6 +108,20 @@ func (p *Pool) IsCooling(addr string) bool {
 	until, ok := p.downUntil[addr]
 	p.mu.RUnlock()
 	return ok && time.Now().Before(until)
+}
+
+// CooldownSize returns the number of backends currently marked in active cooldown.
+func (p *Pool) CooldownSize() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	n := 0
+	for _, until := range p.downUntil {
+		if now.Before(until) {
+			n++
+		}
+	}
+	return n
 }
 
 // Remove deletes a backend; returns false if not found.
