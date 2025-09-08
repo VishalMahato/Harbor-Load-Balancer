@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context" // NEW: for signal-aware context
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal" // NEW: to catch SIGINT/SIGTERM
 	"strconv"
 	"strings"
+	"sync"    // NEW: wait for in-flight connections to drain
+	"syscall" // NEW: signal constants
 	"time"
 
 	"github.com/vishalmahato/harbor-load-balancer/internal/lb"
@@ -55,6 +59,7 @@ func main() {
 // exponentially increase the time and stop at 1 second
 // on next successfull accept we will reset the delay to 0
 
+// listenAndProxy is now an orchestrator: build config, wire signals, run loop, drain.
 func listenAndProxy(addr string, pool *lb.Pool) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -62,19 +67,36 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 	}
 	log.Println("Started listening on", addr)
 
-	dialTO := envMs("LB_DIAL_TIMEOUT_MS", 1500) // default 1.5s
-	ioTO := envMs("LB_IO_TIMEOUT_MS", 10000)
-	noDelay := envBool("LB_TCP_NODELAY", false)
-	kaPeriod := envMs("LB_TCP_KEEPALIVE_MS", 30000) // TCP keepalive probe period -- complements sliding idle logic
-	// keep alive is a kernel feature which sends tiny probe packets on an idle tcp connection to check if the peer is still there
-	//  and to keep nat and firewal mapings from expiring, If servel probes get No ACK , the OS mark the sockets dead
-	// and next read or writ on that connection errors out
-	// very useful for websoket , sse , gRPC
+	// set up signal-aware context for graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	// NEW: concurrency cap (semaphore)
-	maxInFlight := envInt("LB_MAX_INFLIGHT", 1024) // 1024 concurent connection
-	sem := make(chan struct{}, maxInFlight)
+	cfg := loadProxyConfigFromEnv()
 
+	// concurrency cap to restrict a limit of users
+	sem := make(chan struct{}, cfg.maxInFlight)
+
+	//  tracks in-flight handler goroutines so we can Wait() on shutdown
+	var wg sync.WaitGroup
+
+	//  on signal, close the listener to unblock Accept() immediately
+	go func() {
+		<-ctx.Done()
+		log.Println("shutdown signal received; closing listener...")
+		_ = ln.Close() // notee : triggers net.ErrClosed in Accept loop
+	}()
+
+	// Run the accept loop
+	if err := serveLoop(ctx, ln, pool, cfg, sem, &wg); err != nil {
+		return err
+	}
+
+	// Graceful drain with a deadline
+	return drain(&wg, cfg.grace, sem)
+}
+
+// serveLoop owns Accept/backoff and spawns per-connection handlers.
+func serveLoop(ctx context.Context, ln net.Listener, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup) error {
 	var tempDelay time.Duration // exponential backoff on temporary/timeout errors e.g., OS under pressure, backlog/buffer/fd limits
 
 	for {
@@ -82,8 +104,8 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 		if err != nil {
 			// listener closed (e.g., during shutdown)
 			if errors.Is(err, net.ErrClosed) {
-				return nil
-				// gracefully shutting it down
+				//  break to drain in-flight connections
+				break
 			}
 
 			if isTransientAcceptErr(err) {
@@ -105,51 +127,160 @@ func listenAndProxy(addr string, pool *lb.Pool) error {
 			return err
 		}
 		tempDelay = 0
-		select {
-		case sem <- struct{}{}:
-			// acquired capacity — proceed
-		default:
+
+		//  concurrency cap (semaphore)
+		if !acquireSlot(sem) {
 			_ = c.Close()
 
-			log.Printf("capacity full (LB_MAX_INFLIGHT=%d); dropped connection", maxInFlight)
+			log.Printf("capacity full (LB_MAX_INFLIGHT=%d); dropped connection", cfg.maxInFlight)
 			continue
 		}
-		// Enable TCP keepalive on the accepted client socket -- client to LB
-		if tc, ok := c.(*net.TCPConn); ok {
-			_ = tc.SetKeepAlive(true)
-			_ = tc.SetKeepAlivePeriod(kaPeriod)
-			if noDelay {
-				_ = tc.SetNoDelay(true) //  controlled by LB_TCP_NODELAY
-			}
 
+		// Enable TCP keepalive on the accepted client socket -- client to LB
+		setClientSocketOptions(c, cfg)
+
+		wg.Add(1)
+		go handleConn(c, pool, cfg, sem, wg)
+	}
+	return nil
+}
+
+// handleConn does per-connection work: retry dial, bridge, cleanup.
+func handleConn(c net.Conn, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup) {
+	// release capacity slot and close client when done
+	defer func() { <-sem }()
+	defer c.Close()
+	//  mark handler complete for shutdown drain
+	defer wg.Done()
+
+	// dialer with timeout and keepalive for the backend side
+	d := &net.Dialer{Timeout: cfg.dialTO, KeepAlive: cfg.kaPeriod}
+
+	backend, release, err := dialBackendWithRetry(pool, d, cfg.maxRetries, cfg.cooldown)
+	if err != nil {
+		// exhausted retries or no healthy backends
+		return
+	}
+
+	defer release()
+	defer backend.Close()
+
+	if tb, ok := backend.(*net.TCPConn); ok && cfg.noDelay {
+		_ = tb.SetNoDelay(true)
+	}
+
+	bridge(c, backend, cfg.ioTO)
+}
+
+// dialBackendWithRetry selects a backend and dials it, retrying on failures.
+// Uses pool.Acquire()/release() and MarkDown(cooldown) on failures.
+func dialBackendWithRetry(pool *lb.Pool, d *net.Dialer, maxRetries int, cooldown time.Duration) (net.Conn, func(), error) {
+	var (
+		backend net.Conn
+		target  string
+		release func()
+		ok      bool
+		err     error
+	)
+
+	//  bounded retry loop across backends
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+
+		target, release, ok = pool.Acquire()
+		if !ok {
+			// no healthy backends available -- note:  Acquire skips those in cooldown
+			return nil, func() {}, fmt.Errorf("no healthy backends available")
 		}
 
-		go func(c net.Conn) {
-			// release capacity slot and close client when done
-			defer func() { <-sem }()
-			defer c.Close()
-			target, release, ok := pool.Acquire()
-			if !ok {
-				return
-			}
-			defer release()
+		backend, err = d.Dial("tcp", target)
+		if err == nil {
+			// success: break out and proceed with bridge
+			return backend, release, nil
+		}
 
-			// dial with timeout so dead/blackholed backends fail fast
-			// b, err := net.DialTimeout("tcp", target, dialTO)
+		// dial failed - we will release LeastConn slot immediately
+		release()
+		// mark the backend down for a short cooldown so Acquire() skips it next time
+		pool.MarkDown(target, cooldown)
+		log.Printf("dial error: target=%s err=%v (attempt %d/%d)", target, err, attempt+1, maxRetries+1)
 
-			d := &net.Dialer{Timeout: dialTO, KeepAlive: kaPeriod}
-			b, err := d.Dial("tcp", target)
-			if err != nil {
-				log.Println("dial error:", err)
-				return
-			}
-			defer b.Close()
-			if tb, ok := b.(*net.TCPConn); ok && noDelay {
-				_ = tb.SetNoDelay(true)
-			}
+		continue
+	}
+	// if still error persists return otherwise we have to release
+	return nil, func() {}, err
+}
 
-			bridge(c, b, ioTO)
-		}(c)
+// drain waits for in-flight handlers or times out after grace.
+func drain(wg *sync.WaitGroup, grace time.Duration, sem chan struct{}) error {
+	// graceful drain — wait for in-flight handlers or time out
+	done := make(chan struct{})
+	go func() {
+		wg.Wait() // waits for all handler goroutines to finish
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("all connections drained; exiting")
+	case <-time.After(grace):
+		// We can't force-close individual conns here without tracking them,
+		// but we at least report how many are still active (len(sem)).
+		log.Printf("grace period %v elapsed; exiting with %d active connection(s)", grace, len(sem))
+	}
+	return nil
+}
+
+// acquireSlot tries a non-blocking semaphore acquire (fast-fail when full).
+func acquireSlot(sem chan struct{}) bool {
+	select {
+	case sem <- struct{}{}:
+		// acquired capacity — proceed
+		return true
+	default:
+		return false
+	}
+}
+
+// Enable TCP keepalive on  client socket
+func setClientSocketOptions(c net.Conn, cfg proxyConfig) {
+
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(cfg.kaPeriod)
+		if cfg.noDelay {
+			_ = tc.SetNoDelay(true) //  controlled by LB_TCP_NODELAY
+		}
+	}
+}
+
+type proxyConfig struct {
+	dialTO, ioTO, kaPeriod, grace time.Duration
+	noDelay                       bool
+	maxInFlight                   int
+	maxRetries                    int
+	cooldown                      time.Duration
+}
+
+// loadProxyConfigFromEnv
+func loadProxyConfigFromEnv() proxyConfig {
+	dialTO := envMs("LB_DIAL_TIMEOUT_MS", 1500)
+	ioTO := envMs("LB_IO_TIMEOUT_MS", 10000)
+	noDelay := envBool("LB_TCP_NODELAY", false)
+	kaPeriod := envMs("LB_TCP_KEEPALIVE_MS", 30000)
+	maxRetries := envInt("LB_DIAL_RETRIES", 1)        // try up to 1 additional backend by default
+	cooldown := envMs("LB_BACKEND_COOLDOWN_MS", 5000) // mark failing backend "down" for 5s
+	maxInFlight := envInt("LB_MAX_INFLIGHT", 1024)    // 1024 concurent connection
+	grace := envMs("LB_SHUTDOWN_GRACE_MS", 5000)
+
+	return proxyConfig{
+		dialTO:      dialTO,
+		ioTO:        ioTO,
+		noDelay:     noDelay,
+		kaPeriod:    kaPeriod,
+		maxRetries:  maxRetries,
+		cooldown:    cooldown,
+		maxInFlight: maxInFlight,
+		grace:       grace,
 	}
 }
 
@@ -196,7 +327,6 @@ func envBool(name string, def bool) bool {
 	return def
 }
 
-// to read time env vars- read millisecond env var with a sane default
 func envMs(name string, def int) time.Duration {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {

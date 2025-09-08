@@ -83,7 +83,7 @@ func (p *Pool) Add(addr string) bool {
 // MarkDown marks a backend as unavailable for the given cooldown duration.
 //
 // Acquire() will skip this addr until the cooldown expires.
-func (p *Pool) Markdown(addr string, cooldown time.Duration) {
+func (p *Pool) MarkDown(addr string, cooldown time.Duration) {
 	if cooldown <= 0 {
 		return
 	}
@@ -99,6 +99,14 @@ func (p *Pool) MarkSuccess(addr string) {
 	p.mu.Lock()
 	delete(p.downUntil, addr)
 	p.mu.Unlock()
+}
+
+// IsCooling returns true if addr has an unexpired cooldown mark.
+func (p *Pool) IsCooling(addr string) bool {
+	p.mu.RLock()
+	until, ok := p.downUntil[addr]
+	p.mu.RUnlock()
+	return ok && time.Now().Before(until)
 }
 
 // Remove deletes a backend; returns false if not found.
