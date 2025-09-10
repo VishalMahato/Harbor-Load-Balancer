@@ -8,10 +8,9 @@ import (
 // Pool stores backends and delegates picking to a Strategy.
 // It owns the lock protecting the nodes slice.
 type Pool struct {
-	mu    sync.RWMutex
-	nodes []string
-	// for health status
-	downUntil map[string]time.Time
+	mu        sync.RWMutex
+	nodes     []string
+	downUntil map[string]time.Time // cooldown window per addr
 	strat     Strategy
 }
 
@@ -36,8 +35,8 @@ func (p *Pool) SetStrategy(s Strategy) {
 	p.mu.Unlock()
 }
 
-// Acquire returns (addr, release, ok). Call release() when done to
-// decrement strategy-specific in-flight counters (LeastConn).
+// Acquire returns (addr, release, ok). Call release() when done
+// to decrement strategy-specific in-flight counters (LeastConn).
 func (p *Pool) Acquire() (string, func(), bool) {
 	p.mu.RLock()
 	n := len(p.nodes)
@@ -46,22 +45,25 @@ func (p *Pool) Acquire() (string, func(), bool) {
 		return "", func() {}, false
 	}
 	now := time.Now()
-	// to retry we will do loop till n
+
+	// Try up to n picks, skipping those in cooldown.
 	for tries := 0; tries < n; tries++ {
 		idx := p.strat.Pick(n)
 		addr := p.nodes[idx]
-		// skip if still cooling down.
+
+		// Skip if cooling down.
 		if until, cooling := p.downUntil[addr]; cooling && now.Before(until) {
 			continue
 		}
-		// for leastconn have to start it as its track in-flight
+
+		// in-flight ++ for LeastConn (safe: strategies should use atomics)
 		p.strat.Start(idx)
 		p.mu.RUnlock()
 
 		release := func() { p.strat.Done(idx) }
-
 		return addr, release, true
 	}
+
 	p.mu.RUnlock()
 	return "", func() {}, false
 }
@@ -81,7 +83,6 @@ func (p *Pool) Add(addr string) bool {
 }
 
 // MarkDown marks a backend as unavailable for the given cooldown duration.
-//
 // Acquire() will skip this addr until the cooldown expires.
 func (p *Pool) MarkDown(addr string, cooldown time.Duration) {
 	if cooldown <= 0 {
@@ -92,10 +93,7 @@ func (p *Pool) MarkDown(addr string, cooldown time.Duration) {
 	p.mu.Unlock()
 }
 
-// MarkSuccess clears any cooldown mark for a backend.
-//
-// WHEN to call: after a successful connection/use of a backend that may have
-// been marked down earlier. This lets it re-enter rotation immediately.
+// MarkSuccess clears any cooldown mark for a backend immediately.
 func (p *Pool) MarkSuccess(addr string) {
 	p.mu.Lock()
 	delete(p.downUntil, addr)
@@ -111,7 +109,7 @@ func (p *Pool) IsCooling(addr string) bool {
 }
 
 // CooldownSize returns the number of backends currently marked in active cooldown.
-func (p *Pool) CooldownSize() int {
+func (p *Pool) CoolDownSize() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()

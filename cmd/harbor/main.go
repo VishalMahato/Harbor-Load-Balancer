@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic" // NEW: metrics atomics
 	"syscall"
 	"time"
 
@@ -20,12 +19,21 @@ import (
 )
 
 func main() {
-	fmt.Println("Harbor up ")
+	fmt.Println("Harbor up")
 
-	// DEV SEED: keep for now, but gate it.
-	backends := []string{"127.0.0.1:9001", "127.0.0.1:9002"}
-	fmt.Println("backends", backends)
+	//  Allow seed on if LB_ALLOW_DEV_SEED=1.
+	backends := parseBackendList(os.Getenv("BACKENDS"))
+	if len(backends) == 0 {
+		if os.Getenv("LB_ALLOW_DEV_SEED") == "1" {
+			backends = []string{"127.0.0.1:9001", "127.0.0.1:9002"} // dev-only
+			log.Println("WARNING: using dev seed backends; set BACKENDS in production.")
+		} else {
+			log.Fatal("no BACKENDS configured; set BACKENDS=host:port[,host:port...]")
+		}
+	}
+	log.Println("backends:", backends)
 
+	// Strategy
 	var strat lb.Strategy
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("STRATEGY")))
 	switch v {
@@ -40,7 +48,7 @@ func main() {
 
 	pool := lb.NewPool(backends, strat)
 
-	//  metrics server
+	// Metrics server
 	metricsAddr := os.Getenv("LB_METRICS_ADDR")
 	if metricsAddr == "" {
 		metricsAddr = ":9100"
@@ -48,6 +56,7 @@ func main() {
 	m := newMetrics()
 	startMetricsServer(metricsAddr, m, pool)
 
+	// Listener addr
 	listenAddr := os.Getenv("LB_ADDR")
 	if listenAddr == "" {
 		listenAddr = ":9090"
@@ -59,14 +68,6 @@ func main() {
 	}
 }
 
-// Listens and dials the backend -- needs update to handle faulty backend connections or when accept fail as the current code make lb stops when accept fails --- done
-// to solve it we will intentnaly close and do a clean shutdown
-///in case of timeout or temporary error we sleep and retry
-// for non temporary err - return
-// so whats the role of delay here - without delay the for{accept()} can run thousand of times in seconds - spamming logs and making a hot loop
-// exponentially increase the time and stop at 1 second
-// on next successfull accept we will reset the delay to 0
-
 func listenAndProxy(addr string, pool *lb.Pool, m *metrics) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -74,105 +75,108 @@ func listenAndProxy(addr string, pool *lb.Pool, m *metrics) error {
 	}
 	log.Println("Started listening on", addr)
 
-	// set up signal-aware context for graceful shutdown
+	// signal-aware context for graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	cfg := loadProxyConfigFromEnv()
 
-	// concurrency cap to restrict a limit of users
+	// concurrency cap
 	sem := make(chan struct{}, cfg.maxInFlight)
 
-	//  tracks in-flight handler goroutines so we can Wait() on shutdown
+	// track handler goroutines for drain
 	var wg sync.WaitGroup
 
-	//  on signal, close the listener to unblock Accept() immediately
+	// close listener on signal to unblock Accept
 	go func() {
 		<-ctx.Done()
 		log.Println("shutdown signal received; closing listener...")
-		_ = ln.Close() // notee : triggers net.ErrClosed in Accept loop
+		_ = ln.Close() // triggers net.ErrClosed in Accept loop
 	}()
 
-	// Run the accept loop
-	if err := serveLoop(ctx, ln, pool, cfg, sem, &wg, m); err != nil { // NEW: pass metrics
+	// Accept loop
+	if err := serveLoop(ctx, ln, pool, cfg, sem, &wg, m); err != nil {
 		return err
 	}
 
-	// Graceful drain with a deadline
+	// Graceful drain
 	return drain(&wg, cfg.grace, sem)
 }
 
-// serveLoop owns Accept/backoff and spawns per-connection handlers.
-func serveLoop(ctx context.Context, ln net.Listener, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup, m *metrics) error { // NEW: metrics
-	var tempDelay time.Duration // exponential backoff on temporary/timeout errors e.g., OS under pressure, backlog/buffer/fd limits
+// Accept/backoff and per-connection handlers.
+func serveLoop(ctx context.Context, ln net.Listener, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup, m *metrics) error {
+	var tempDelay time.Duration
 
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			// listener closed (e.g., during shutdown)
 			if errors.Is(err, net.ErrClosed) {
-				//  break to drain in-flight connections
+				// listener closed (shutdown)
 				break
 			}
 
-			atomic.AddInt64(&m.acceptErrorsTotal, 1)
+			// classify error; backoff only on transient
+			if isTransientAcceptErr(err) {
+				m.acceptErrorsTotal.Add(1)
 
-			if tempDelay == 0 {
-				tempDelay = 5 * time.Millisecond
-			} else {
-				tempDelay *= 2
-				if tempDelay > time.Second {
-					tempDelay = time.Second
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+					if tempDelay > time.Second {
+						tempDelay = time.Second
+					}
 				}
+				log.Printf("accept transient: %v; retrying in %v", err, tempDelay)
+
+				// ctx-aware sleep
+				select {
+				case <-time.After(tempDelay):
+				case <-ctx.Done():
+					return nil
+				}
+				continue
 			}
-			log.Printf("accept error: %v; retrying in %v", err, tempDelay)
-			time.Sleep(tempDelay)
-			continue
+			// non-transient: bubble up
+			return err
 		}
 		tempDelay = 0
 
-		//  concurrency cap (semaphore)
+		// capacity guard
 		if !acquireSlot(sem) {
 			_ = c.Close()
-
-			// metrics — capacity drop
-			atomic.AddInt64(&m.capacityDroppedTotal, 1)
-
+			m.capacityDroppedTotal.Add(1)
 			log.Printf("capacity full (LB_MAX_INFLIGHT=%d); dropped connection", cfg.maxInFlight)
 			continue
 		}
 
-		// metrics — successful accept
-		atomic.AddInt64(&m.acceptsTotal, 1)
+		m.acceptsTotal.Add(1)
 
-		// Enable TCP keepalive on the accepted client socket -- client to LB
+		// client socket options (client->LB)
 		setClientSocketOptions(c, cfg)
 
 		wg.Add(1)
-		atomic.AddInt64(&m.activeConns, 1)      // NEW: metrics — gauge inc
-		go handleConn(c, pool, cfg, sem, wg, m) // NEW: pass metrics
+		m.activeConns.Add(1)
+		go handleConn(ctx, c, pool, cfg, sem, wg, m)
 	}
 	return nil
 }
 
-// handleConn does per-connection work: retry dial, bridge, cleanup.
-func handleConn(c net.Conn, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup, m *metrics) { // NEW: metrics
-	// release capacity slot and close client when done
+// Per-connection: pick backend with retries, bridge, cleanup.
+func handleConn(ctx context.Context, c net.Conn, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, wg *sync.WaitGroup, m *metrics) {
 	defer func() { <-sem }()
 	defer c.Close()
-	//  mark handler complete for shutdown drain
 	defer wg.Done()
-	defer atomic.AddInt64(&m.activeConns, -1) // metrics — gauge dec
+	defer m.activeConns.Add(-1)
 
-	// dialer with timeout and keepalive for the backend side
-	d := &net.Dialer{Timeout: cfg.dialTO, KeepAlive: cfg.kaPeriod}
+	// backend dialer (base settings; timeout is enforced via DialContext)
+	d := &net.Dialer{KeepAlive: cfg.kaPeriod}
 
-	backend, release, err := dialBackendWithRetry(pool, d, cfg.maxRetries, cfg.cooldown, m) // NEW: pass metrics
+	backend, release, err := dialBackendWithRetry(ctx, pool, d, cfg.maxRetries, cfg.cooldown, cfg.dialTO, m)
 	if err != nil {
-		// exhausted retries or no healthy backends
+		// exhausted retries / no backend
 		return
 	}
-
 	defer release()
 	defer backend.Close()
 
@@ -183,9 +187,8 @@ func handleConn(c net.Conn, pool *lb.Pool, cfg proxyConfig, sem chan struct{}, w
 	bridge(c, backend, cfg.ioTO)
 }
 
-// dialBackendWithRetry selects a backend and dials it, retrying on failures.
-// Uses pool.Acquire()/release() and MarkDown(cooldown) on failures.
-func dialBackendWithRetry(pool *lb.Pool, d *net.Dialer, maxRetries int, cooldown time.Duration, m *metrics) (net.Conn, func(), error) { // NEW: metrics
+// Pick + dial with retries; marks failures on cooldown and clears cooldown on success.
+func dialBackendWithRetry(ctx context.Context, pool *lb.Pool, d *net.Dialer, maxRetries int, cooldown time.Duration, perAttemptTO time.Duration, m *metrics) (net.Conn, func(), error) {
 	var (
 		backend net.Conn
 		target  string
@@ -194,83 +197,76 @@ func dialBackendWithRetry(pool *lb.Pool, d *net.Dialer, maxRetries int, cooldown
 		err     error
 	)
 
-	//  bounded retry loop across backends
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-
 		if attempt > 0 {
-			atomic.AddInt64(&m.retriesTotal, 1) //metrics — retry count
+			m.retriesTotal.Add(1)
 		}
 
 		target, release, ok = pool.Acquire()
 		if !ok {
-			// no healthy backends available -- note:  Acquire skips those in cooldown
 			return nil, func() {}, fmt.Errorf("no healthy backends available")
 		}
 
-		//  metrics — note pick & total dials
 		m.recordPick(target)
-		atomic.AddInt64(&m.dialsTotal, 1)
+		m.dialsTotal.Add(1)
+		// ctx-aware per-attempt timeout
+		dctx, cancel := context.WithTimeout(ctx, perAttemptTO)
+		backend, err = d.DialContext(dctx, "tcp", target)
+		cancel()
 
-		backend, err = d.Dial("tcp", target)
 		if err == nil {
-			//  break out and proceed with bridge
+			// Success: clear any prior cooldown so it re-enters rotation immediately.
+			pool.MarkSuccess(target)
 			return backend, release, nil
 		}
 
-		// dial failed - we will release LeastConn slot immediately
+		// Fail: release LeastConn slot and mark down for cooldown
 		release()
-		// mark the backend down for a short cooldown so Acquire() skips it next time
 		pool.MarkDown(target, cooldown)
-
-		// NEW: metrics — per-backend failure & total failures
 		m.recordDialFailure(target)
-
 		log.Printf("dial error: target=%s err=%v (attempt %d/%d)", target, err, attempt+1, maxRetries+1)
-		continue
+
+		// If the parent ctx is cancelled (shutdown), stop retrying immediately.
+		select {
+		case <-ctx.Done():
+			return nil, func() {}, ctx.Err()
+		default:
+		}
 	}
-	// if still error persists return otherwise we have to release
 	return nil, func() {}, err
 }
 
-// drain waits for in-flight handlers or times out after grace.
+// Graceful drain with deadline.
 func drain(wg *sync.WaitGroup, grace time.Duration, sem chan struct{}) error {
-	// graceful drain — wait for in-flight handlers or time out
 	done := make(chan struct{})
-	go func() {
-		wg.Wait() // waits for all handler goroutines to finish
-		close(done)
-	}()
+	go func() { wg.Wait(); close(done) }()
 
 	select {
 	case <-done:
 		log.Println("all connections drained; exiting")
 	case <-time.After(grace):
-		// We can't force-close individual conns here without tracking them,
-		// but we at least report how many are still active (len(sem)).
 		log.Printf("grace period %v elapsed; exiting with %d active connection(s)", grace, len(sem))
 	}
 	return nil
 }
 
-// acquireSlot tries a non-blocking semaphore acquire (fast-fail when full).
+// Non-blocking semaphore acquire.
 func acquireSlot(sem chan struct{}) bool {
 	select {
 	case sem <- struct{}{}:
-		// acquired capacity — proceed
 		return true
 	default:
 		return false
 	}
 }
 
-// Enable TCP keepalive on  client socket
+// Client socket options (LB side).
 func setClientSocketOptions(c net.Conn, cfg proxyConfig) {
-
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(cfg.kaPeriod)
 		if cfg.noDelay {
-			_ = tc.SetNoDelay(true) //  controlled by LB_TCP_NODELAY
+			_ = tc.SetNoDelay(true)
 		}
 	}
 }
@@ -283,15 +279,14 @@ type proxyConfig struct {
 	cooldown                      time.Duration
 }
 
-// loadProxyConfigFromEnv
 func loadProxyConfigFromEnv() proxyConfig {
 	dialTO := envMs("LB_DIAL_TIMEOUT_MS", 1500)
 	ioTO := envMs("LB_IO_TIMEOUT_MS", 10000)
 	noDelay := envBool("LB_TCP_NODELAY", false)
 	kaPeriod := envMs("LB_TCP_KEEPALIVE_MS", 30000)
-	maxRetries := envInt("LB_DIAL_RETRIES", 1)        // try up to 1 additional backend by default
-	cooldown := envMs("LB_BACKEND_COOLDOWN_MS", 5000) // mark failing backend "down" for 5s
-	maxInFlight := envInt("LB_MAX_INFLIGHT", 1024)    // 1024 concurent connection
+	maxRetries := envInt("LB_DIAL_RETRIES", 1)
+	cooldown := envMs("LB_BACKEND_COOLDOWN_MS", 5000)
+	maxInFlight := envInt("LB_MAX_INFLIGHT", 1024)
 	grace := envMs("LB_SHUTDOWN_GRACE_MS", 5000)
 
 	return proxyConfig{
@@ -315,8 +310,6 @@ func bridge(a, b net.Conn, idle time.Duration) {
 	// a -> b
 	go func() {
 		_, _ = io.Copy(sb, sa)
-		//if type of b is not net.TCPconn we can't call CloseWrite(),
-		// can't half close , it will be closed fully once done
 		if t, ok := b.(*net.TCPConn); ok {
 			_ = t.CloseWrite()
 		}
@@ -336,7 +329,6 @@ func bridge(a, b net.Conn, idle time.Duration) {
 	<-done
 }
 
-// to read bool env vars
 func envBool(name string, def bool) bool {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
 	if v == "" {
@@ -357,10 +349,10 @@ func envMs(name string, def int) time.Duration {
 		return time.Duration(def) * time.Millisecond
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 { // allow 0 to mean "disable"
+	if err != nil || n < 0 {
 		return time.Duration(def) * time.Millisecond
 	}
-	return time.Duration(n) * time.Millisecond // returns 0 if n==0 -> “no idle timeout”
+	return time.Duration(n) * time.Millisecond
 }
 
 func envInt(name string, def int) int {
@@ -375,8 +367,7 @@ func envInt(name string, def int) int {
 	return n
 }
 
-// slidingConn bumps deadlines on every Read/Write, implementing an idle timeout.
-// If idle <= 0, no deadlines are set (i.e., no idle timeout).
+// slidingConn enforces idle timeouts by refreshing deadlines per Read/Write.
 type slidingConn struct {
 	net.Conn
 	idle time.Duration
@@ -399,7 +390,7 @@ func (s *slidingConn) Write(p []byte) (int, error) {
 // Broad-but-safe classification without OS-specific errno checks.
 func isTransientAcceptErr(err error) bool {
 	var ne net.Error
-	if errors.As(err, &ne) && (ne.Timeout()) {
+	if errors.As(err, &ne) && ne.Timeout() {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
@@ -410,4 +401,19 @@ func isTransientAcceptErr(err error) bool {
 		strings.Contains(msg, "try again") ||
 		strings.Contains(msg, "connection aborted") || // ECONNABORTED
 		strings.Contains(msg, "protocol error")
+}
+
+func parseBackendList(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
